@@ -3,6 +3,7 @@ ProductCRM — PM-facing Streamlit UI.
 Run with: streamlit run app.py
 """
 from datetime import date, datetime
+from urllib.parse import quote
 
 import pandas as pd
 import streamlit as st
@@ -10,7 +11,6 @@ import streamlit as st
 from src.hubspot import client as hs
 from src.selection.pipeline import run_selection
 from src.outreach.sender import send_drafts
-from src.interviews.transcript import fetch_latest_transcript
 from src.interviews.insights import generate_exec_summary
 from src.notion.interview_page import create_interview_page
 from src.notion.digest import generate_weekly_digest
@@ -35,6 +35,8 @@ if "pool_size" not in st.session_state:
     st.session_state.pool_size = 0
 if "completed_interviews" not in st.session_state:
     st.session_state.completed_interviews = []  # list of {company, contact, date, summary}
+if "drafts" not in st.session_state:
+    st.session_state.drafts = []
 
 
 # ── Tab 1: Filter & Sample ─────────────────────────────────────────────────────
@@ -124,25 +126,35 @@ with tab2:
     else:
         st.write(
             f"Ready to generate outreach emails for **{len(st.session_state.interviews)}** contacts. "
-            "Review each email below, then copy and send manually from Gmail."
+            "Edit each email, then open in Gmail to send."
         )
         if st.button("Generate emails", type="primary"):
             with st.spinner("Generating personalised emails..."):
                 try:
-                    drafts = send_drafts(st.session_state.interviews)
-                    st.success(f"{len(drafts)} emails generated.")
-                    for d in drafts:
-                        with st.expander(f"{d['contact_email']} — {d['subject']}"):
-                            st.text(d["body"])
+                    st.session_state.drafts = send_drafts(st.session_state.interviews)
                 except Exception as e:
                     st.error(f"Failed to generate emails: {e}")
+
+        if st.session_state.drafts:
+            st.success(f"{len(st.session_state.drafts)} emails ready.")
+            for idx, d in enumerate(st.session_state.drafts):
+                with st.expander(f"{d['contact_email']} — {d['subject']}"):
+                    subject = st.text_input("Subject", value=d["subject"], key=f"subj_{idx}")
+                    body = st.text_area("Body", value=d["body"], height=200, key=f"body_{idx}")
+                    gmail_url = (
+                        "https://mail.google.com/mail/?view=cm"
+                        f"&to={quote(d['contact_email'])}"
+                        f"&su={quote(subject)}"
+                        f"&body={quote(body)}"
+                    )
+                    st.link_button("Open in Gmail ↗", url=gmail_url)
 
 
 # ── Tab 3: Capture Insights ────────────────────────────────────────────────────
 
 with tab3:
     st.subheader("Capture interview insights")
-    st.write("After a call, fetch the Granola transcript and generate an exec summary.")
+    st.write("Paste the call transcript below, then generate an exec summary and save to Notion.")
 
     col_a, col_b, col_c = st.columns(3)
     with col_a:
@@ -152,43 +164,36 @@ with tab3:
     with col_c:
         interview_date = st.date_input("Interview date", value=date.today())
 
-    meeting_hint = st.text_input("Meeting title hint (optional — helps Granola find the right call)")
+    transcript = st.text_area("Transcript", height=250, placeholder="Paste the call transcript here…")
 
-    if st.button("Fetch transcript & generate summary", type="primary"):
+    if st.button("Generate exec summary", type="primary"):
         if not company_name or not contact_name:
             st.warning("Please fill in company and contact name.")
+        elif not transcript.strip():
+            st.warning("Please paste the transcript.")
         else:
-            with st.spinner("Fetching transcript from Granola..."):
-                transcript = fetch_latest_transcript(meeting_hint or company_name)
+            with st.spinner("Generating exec summary..."):
+                summary = generate_exec_summary(transcript, company_name, contact_name)
 
-            if not transcript:
-                st.error("No transcript found. Make sure the call was recorded in Granola.")
-            else:
-                with st.spinner("Generating exec summary..."):
-                    summary = generate_exec_summary(transcript, company_name, contact_name)
+            st.subheader("Exec Summary")
+            st.markdown(summary)
 
-                st.subheader("Exec Summary")
-                st.markdown(summary)
-
-                with st.expander("Full transcript"):
-                    st.text(transcript)
-
-                if st.button("Save to Notion"):
-                    with st.spinner("Creating Notion page..."):
-                        url = create_interview_page(
-                            company_name=company_name,
-                            contact_name=contact_name,
-                            interview_date=interview_date.isoformat(),
-                            transcript=transcript,
-                            exec_summary=summary,
-                        )
-                        st.success(f"Notion page created: {url}")
-                        st.session_state.completed_interviews.append({
-                            "company": company_name,
-                            "contact": contact_name,
-                            "date": interview_date.isoformat(),
-                            "summary": summary,
-                        })
+            if st.button("Save to Notion"):
+                with st.spinner("Creating Notion page..."):
+                    url = create_interview_page(
+                        company_name=company_name,
+                        contact_name=contact_name,
+                        interview_date=interview_date.isoformat(),
+                        transcript=transcript,
+                        exec_summary=summary,
+                    )
+                    st.success(f"Notion page created: {url}")
+                    st.session_state.completed_interviews.append({
+                        "company": company_name,
+                        "contact": contact_name,
+                        "date": interview_date.isoformat(),
+                        "summary": summary,
+                    })
 
 
 # ── Tab 4: Weekly Digest ───────────────────────────────────────────────────────

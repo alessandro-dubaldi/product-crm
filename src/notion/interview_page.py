@@ -1,10 +1,12 @@
-"""
-Creates a Notion page per interview containing the transcript and exec summary.
-"""
-import anthropic
-from config.settings import ANTHROPIC_API_KEY, NOTION_TOKEN, NOTION_DIGEST_PAGE_ID
+import requests
+from config.settings import NOTION_TOKEN, NOTION_DIGEST_PAGE_ID
 
-_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+_BASE = "https://api.notion.com/v1"
+_HEADERS = {
+    "Authorization": f"Bearer {NOTION_TOKEN}",
+    "Notion-Version": "2022-06-28",
+    "Content-Type": "application/json",
+}
 
 
 def create_interview_page(
@@ -14,40 +16,50 @@ def create_interview_page(
     transcript: str,
     exec_summary: str,
 ) -> str:
-    """
-    Creates a Notion page under NOTION_DIGEST_PAGE_ID.
-    Returns the URL of the created page.
-    """
-    prompt = f"""
-Create a Notion page with the following content. Use the Notion MCP tool.
+    blocks = [
+        _heading(f"Interview with {contact_name} · {company_name} · {interview_date}", 1),
+        _heading("Executive Summary", 2),
+        *_paragraphs(exec_summary),
+        {"object": "block", "type": "divider", "divider": {}},
+        _heading("Full Transcript", 2),
+        *_paragraphs(transcript),
+    ]
 
-Parent page ID: {NOTION_DIGEST_PAGE_ID}
-Page title: "Interview — {company_name} ({interview_date})"
+    body = {
+        "parent": {"page_id": NOTION_DIGEST_PAGE_ID},
+        "properties": {
+            "title": {"title": [{"type": "text", "text": {
+                "content": f"Interview — {company_name} ({interview_date})"
+            }}]}
+        },
+        "children": blocks[:100],
+    }
+    r = requests.post(f"{_BASE}/pages", headers=_HEADERS, json=body, timeout=30)
+    r.raise_for_status()
+    page_id = r.json()["id"]
 
-Page content (in order):
-1. A header: "Interview with {contact_name} · {company_name} · {interview_date}"
-2. A section titled "Executive Summary" with this content:
-{exec_summary}
+    for i in range(100, len(blocks), 100):
+        requests.patch(
+            f"{_BASE}/blocks/{page_id}/children",
+            headers=_HEADERS,
+            json={"children": blocks[i:i + 100]},
+            timeout=30,
+        ).raise_for_status()
 
-3. A divider
+    return f"https://notion.so/{page_id.replace('-', '')}"
 
-4. A section titled "Full Transcript" with this content:
-{transcript}
 
-After creating the page, return only the page URL.
-"""
+def _heading(text: str, level: int) -> dict:
+    key = f"heading_{level}"
+    return {"object": "block", "type": key, key: {
+        "rich_text": [{"type": "text", "text": {"content": text[:2000]}}]
+    }}
 
-    response = _client.beta.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=512,
-        betas=["mcp-client-2025-04-04"],
-        mcp_servers=[{
-            "type": "url",
-            "url": "https://mcp.claude.ai/notion",
-            "name": "notion",
-            "authorization_token": NOTION_TOKEN,
-        }],
-        messages=[{"role": "user", "content": prompt}],
-    )
 
-    return response.content[0].text.strip()
+def _paragraphs(text: str) -> list[dict]:
+    return [
+        {"object": "block", "type": "paragraph", "paragraph": {
+            "rich_text": [{"type": "text", "text": {"content": chunk}}]
+        }}
+        for chunk in [text[i:i + 2000] for i in range(0, max(len(text), 1), 2000)]
+    ]
