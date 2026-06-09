@@ -42,11 +42,17 @@ if "completed_interviews" not in st.session_state:
 with tab1:
     st.subheader("Filter companies")
 
+    @st.cache_data(ttl=3600)
+    def load_filter_options():
+        return (
+            hs.fetch_property_options("companies", "nature"),
+            hs.fetch_property_options("companies", "tier_company"),
+            hs.fetch_property_options("companies", "macro_category"),
+        )
+
     with st.spinner("Loading HubSpot filter options..."):
         try:
-            nature_options = hs.fetch_property_options("companies", "nature")
-            tier_options = hs.fetch_property_options("companies", "tier_company")
-            category_options = hs.fetch_property_options("companies", "macro_category")
+            nature_options, tier_options, category_options = load_filter_options()
         except Exception as e:
             st.error(f"Could not load HubSpot options: {e}")
             nature_options, tier_options, category_options = [], [], []
@@ -117,19 +123,19 @@ with tab2:
         st.info("Run the filter & sample step first.")
     else:
         st.write(
-            f"Ready to create Gmail drafts for **{len(st.session_state.interviews)}** contacts. "
-            "Drafts will appear in your Gmail — review before sending."
+            f"Ready to generate outreach emails for **{len(st.session_state.interviews)}** contacts. "
+            "Review each email below, then copy and send manually from Gmail."
         )
-        if st.button("Generate & create Gmail drafts", type="primary"):
-            with st.spinner("Generating emails and creating drafts..."):
+        if st.button("Generate emails", type="primary"):
+            with st.spinner("Generating personalised emails..."):
                 try:
                     drafts = send_drafts(st.session_state.interviews)
-                    st.success(f"Created {len(drafts)} Gmail drafts.")
+                    st.success(f"{len(drafts)} emails generated.")
                     for d in drafts:
                         with st.expander(f"{d['contact_email']} — {d['subject']}"):
                             st.text(d["body"])
                 except Exception as e:
-                    st.error(f"Failed to create drafts: {e}")
+                    st.error(f"Failed to generate emails: {e}")
 
 
 # ── Tab 3: Capture Insights ────────────────────────────────────────────────────

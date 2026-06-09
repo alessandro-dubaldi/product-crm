@@ -76,8 +76,9 @@ def fetch_active_companies(
             total = raw.get("total", 0)
         companies.extend(_parse_company(r) for r in raw.get("results", []))
 
+        # Cap at 500 companies — apply filters to narrow the pool further
         after = raw.get("paging", {}).get("next", {}).get("after")
-        if not after:
+        if not after or len(companies) >= 500:
             break
 
     return companies, total
@@ -143,7 +144,7 @@ def fetch_contacts_for_deal(deal_id: str) -> list[Contact]:
         "properties": ["firstname", "lastname", "email", "engagement_score_v2"],
     })
     contacts = [_parse_contact(r) for r in batch.get("results", [])]
-    return [c for c in contacts if c.engagement_score_v2 is not None]
+    return [c for c in contacts if c.engagement_score_v2 is not None and c.email]
 
 
 def _parse_contact(raw: dict) -> Contact:
@@ -151,9 +152,9 @@ def _parse_contact(raw: dict) -> Contact:
     score = props.get("engagement_score_v2")
     return Contact(
         id=str(raw["id"]),
-        first_name=props.get("firstname", ""),
-        last_name=props.get("lastname", ""),
-        email=props.get("email", ""),
+        first_name=props.get("firstname") or "",
+        last_name=props.get("lastname") or "",
+        email=props.get("email") or "",
         engagement_score_v2=float(score) if score else None,
     )
 
