@@ -1,47 +1,51 @@
 """
-HubSpot data access via MCP.
-
-Uses the HubSpot MCP server (@hubspot/mcp-server) through the MCP Python client.
-The server must be running and accessible. Credentials are passed via env var
-HUBSPOT_ACCESS_TOKEN (set in .env).
-
-All public methods return structured Pydantic models — callers never touch raw
-MCP payloads.
+HubSpot data access via the claude.ai MCP integration.
+Uses the Anthropic API MCP client beta — no HubSpot Private App token required.
 """
-import asyncio
-import os
+import json
 from datetime import date
 from typing import Any
 
-from mcp import ClientSession
-from mcp.client.stdio import StdioServerParameters, stdio_client
+import anthropic
 
 from src.hubspot.models import Company, Contact, Deal
-from config.settings import ACTIVE_DEAL_PIPELINE, HUBSPOT_ACCESS_TOKEN
+from config.settings import ANTHROPIC_API_KEY, ACTIVE_DEAL_PIPELINE
+
+_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=300.0)
+
+_HS_MCP = [{"type": "url", "url": "https://mcp.claude.ai/hubspot", "name": "hubspot"}]
 
 
-def _mcp_server_params() -> StdioServerParameters:
-    return StdioServerParameters(
-        command="npx",
-        args=["-y", "@hubspot/mcp-server"],
-        env={**os.environ, "HUBSPOT_ACCESS_TOKEN": HUBSPOT_ACCESS_TOKEN},
+def _call(prompt: str, max_tokens: int = 16000) -> Any:
+    response = _client.beta.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=max_tokens,
+        betas=["mcp-client-2025-04-04"],
+        mcp_servers=_HS_MCP,
+        messages=[{"role": "user", "content": prompt}],
     )
+    text = response.content[-1].text.strip()
+    if text.startswith("```"):
+        parts = text.split("```", 2)
+        inner = parts[1]
+        if inner.startswith("json"):
+            inner = inner[4:].lstrip("\n")
+        text = inner
+    return json.loads(text.strip())
 
 
-async def _call(tool: str, args: dict) -> Any:
-    import json
-    async with stdio_client(_mcp_server_params()) as (read, write):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            result = await session.call_tool(tool, args)
-            if result.content:
-                return json.loads(result.content[0].text)
-            return {}
+def fetch_property_options(object_type: str, property_name: str) -> list[str]:
+    """Enumeration values for a HubSpot property — used to populate UI dropdowns."""
+    raw = _call(
+        f"Use HubSpot to fetch all valid enumeration options for the '{property_name}' "
+        f"property on '{object_type}'. Return ONLY a JSON array of string values, "
+        'e.g. ["val1", "val2"]. No explanation, no markdown.',
+        max_tokens=2048,
+    )
+    return sorted(raw) if isinstance(raw, list) else []
 
 
-# ── Companies ────────────────────────────────────────────────────────────────
-
-async def fetch_active_companies(
+def fetch_qualifying_pool(
     nature: list[str] | None = None,
     tier_company: list[str] | None = None,
     macro_category: list[str] | None = None,
@@ -49,167 +53,116 @@ async def fetch_active_companies(
     beginning_date_to: date | None = None,
     arr_live_min: float | None = None,
     arr_live_max: float | None = None,
-) -> list[Company]:
+) -> tuple[list[Company], int]:
     """
-    Returns companies where arr_live != 0, optionally narrowed by the
-    PM-supplied filters. Deals and contacts are NOT yet populated here —
-    call enrich_company() to traverse the graph.
+    Traverses Company → active Deal → engaged Contact in one Claude/MCP call.
+    Returns (qualifying_companies_with_deals_and_contacts, total_raw_company_count).
+    Capped at the first 100 qualifying companies — apply filters to stay within this.
     """
-    filters = [{"propertyName": "arr_live", "operator": "NEQ", "value": "0"}]
-
+    company_filter_parts = ["arr_live greater than 0"]
     if nature:
-        filters.append({"propertyName": "nature", "operator": "IN", "values": nature})
+        company_filter_parts.append(f"nature IN [{', '.join(nature)}]")
     if tier_company:
-        filters.append({"propertyName": "tier_company", "operator": "IN", "values": tier_company})
+        company_filter_parts.append(f"tier_company IN [{', '.join(tier_company)}]")
     if macro_category:
-        filters.append({"propertyName": "macro_category", "operator": "IN", "values": macro_category})
+        company_filter_parts.append(f"macro_category IN [{', '.join(macro_category)}]")
     if beginning_date_from:
-        filters.append({"propertyName": "beginning_date", "operator": "GTE", "value": beginning_date_from.isoformat()})
+        company_filter_parts.append(f"beginning_date >= {beginning_date_from.isoformat()}")
     if beginning_date_to:
-        filters.append({"propertyName": "beginning_date", "operator": "LTE", "value": beginning_date_to.isoformat()})
+        company_filter_parts.append(f"beginning_date <= {beginning_date_to.isoformat()}")
     if arr_live_min is not None:
-        filters.append({"propertyName": "arr_live", "operator": "GTE", "value": str(arr_live_min)})
+        company_filter_parts.append(f"arr_live >= {arr_live_min}")
     if arr_live_max is not None:
-        filters.append({"propertyName": "arr_live", "operator": "LTE", "value": str(arr_live_max)})
+        company_filter_parts.append(f"arr_live <= {arr_live_max}")
 
-    companies: list[Company] = []
-    after: str | None = None
+    company_filter_desc = " AND ".join(company_filter_parts)
 
-    while True:
-        payload: dict = {
-            "objectType": "companies",
-            "filterGroups": [{"filters": filters}],
-            "properties": ["name", "nature", "tier_company", "macro_category",
-                            "beginning_date", "arr_live", "country"],
-            "limit": 100,
-        }
-        if after:
-            payload["after"] = after
+    prompt = f"""Execute this HubSpot pipeline using search_crm_objects. Return ONLY valid JSON at the end.
 
-        raw = await _call("hubspot-search-objects", payload)
-        companies.extend(_parse_company(r) for r in raw.get("results", []))
+STEP 1 — Search companies where: {company_filter_desc}
+Properties: id, name, nature, tier_company, macro_category, beginning_date, arr_live, country
+Take the first 100 results. Record the total count from the response.
 
-        after = raw.get("paging", {}).get("next", {}).get("after")
-        if not after:
-            break
+STEP 2 — For each company from Step 1:
+Search deals where pipeline = "{ACTIVE_DEAL_PIPELINE}" AND associated with this company.
+Sort by createdate DESCENDING. Take only the most recent deal.
+Skip companies with no deal in that pipeline.
 
-    return companies
+STEP 3 — For each deal from Step 2:
+Search contacts associated with this deal where engagement_score_v2 HAS_PROPERTY.
+Properties: id, firstname, lastname, email, engagement_score_v2
+Take the first contact. Skip deals with no such contact.
+
+STEP 4 — Return ONLY this JSON object (no markdown, no explanation):
+{{
+  "total_companies": <integer total from Step 1>,
+  "entries": [
+    {{
+      "company": {{"id": "123", "name": "Acme", "nature": "Legal", "tier_company": "Lawyer", "macro_category": "Mass Market", "beginning_date": "2024-01-01", "arr_live": 1200.0, "country": "IT"}},
+      "deal": {{"id": "456", "name": "Acme Deal", "created_at": "2024-01-01"}},
+      "contact": {{"id": "789", "first_name": "Mario", "last_name": "Rossi", "email": "mario@acme.it", "engagement_score_v2": 5.0}}
+    }}
+  ]
+}}"""
+
+    raw = _call(prompt, max_tokens=16000)
+    entries = raw.get("entries", [])
+    total = int(raw.get("total_companies", 0))
+    companies = [_parse_entry(e) for e in entries if _entry_valid(e)]
+    return companies, total
 
 
-def _parse_company(raw: dict) -> Company:
-    props = raw.get("properties", {})
+# ── Parsers ───────────────────────────────────────────────────────────────────
+
+def _entry_valid(entry: dict) -> bool:
+    return all(k in entry for k in ("company", "deal", "contact"))
+
+
+def _parse_entry(entry: dict) -> Company:
+    c = entry["company"]
+    d = entry["deal"]
+    ct = entry["contact"]
+
+    contact = Contact(
+        id=str(ct.get("id", "")),
+        first_name=ct.get("first_name") or ct.get("firstname", ""),
+        last_name=ct.get("last_name") or ct.get("lastname", ""),
+        email=ct.get("email", ""),
+        engagement_score_v2=_to_float(ct.get("engagement_score_v2")),
+    )
+    deal = Deal(
+        id=str(d.get("id", "")),
+        name=d.get("name") or d.get("dealname", ""),
+        pipeline=ACTIVE_DEAL_PIPELINE,
+        created_at=_parse_date(d.get("created_at") or d.get("createdate")) or date.today(),
+        contacts=[contact],
+    )
     return Company(
-        id=raw["id"],
-        name=props.get("name", ""),
-        nature=props.get("nature"),
-        tier_company=props.get("tier_company"),
-        macro_category=props.get("macro_category"),
-        beginning_date=_parse_date(props.get("beginning_date")),
-        arr_live=float(props.get("arr_live") or 0),
-        country=props.get("country"),
+        id=str(c.get("id", "")),
+        name=c.get("name", ""),
+        nature=c.get("nature"),
+        tier_company=c.get("tier_company"),
+        macro_category=c.get("macro_category"),
+        beginning_date=_parse_date(c.get("beginning_date")),
+        arr_live=_to_float(c.get("arr_live")) or 0.0,
+        country=c.get("country"),
+        deals=[deal],
     )
 
 
-# ── Deals ─────────────────────────────────────────────────────────────────────
+def _to_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
-async def fetch_deals_for_company(company_id: str) -> list[Deal]:
-    """Returns active deals (pipeline = ACTIVE_DEAL_PIPELINE) for a company."""
-    raw = await _call("hubspot-list-associations", {
-        "objectType": "companies",
-        "objectId": company_id,
-        "toObjectType": "deals",
-    })
-
-    deal_ids = [r["id"] for r in raw.get("results", [])]
-    if not deal_ids:
-        return []
-
-    deals_raw = await _call("hubspot-batch-read-objects", {
-        "objectType": "deals",
-        "inputs": [{"id": d} for d in deal_ids],
-        "properties": ["dealname", "pipeline", "createdate"],
-    })
-
-    active = [
-        _parse_deal(r)
-        for r in deals_raw.get("results", [])
-        if r.get("properties", {}).get("pipeline") == ACTIVE_DEAL_PIPELINE
-    ]
-    active.sort(key=lambda d: d.created_at, reverse=True)
-    return active
-
-
-def _parse_deal(raw: dict) -> Deal:
-    props = raw.get("properties", {})
-    return Deal(
-        id=raw["id"],
-        name=props.get("dealname", ""),
-        pipeline=props.get("pipeline", ""),
-        created_at=_parse_date(props.get("createdate")) or date.today(),
-    )
-
-
-# ── Contacts ──────────────────────────────────────────────────────────────────
-
-async def fetch_contacts_for_deal(deal_id: str) -> list[Contact]:
-    """Returns contacts on a deal that have a non-empty engagement_score_v2."""
-    raw = await _call("hubspot-list-associations", {
-        "objectType": "deals",
-        "objectId": deal_id,
-        "toObjectType": "contacts",
-    })
-
-    contact_ids = [r["id"] for r in raw.get("results", [])]
-    if not contact_ids:
-        return []
-
-    contacts_raw = await _call("hubspot-batch-read-objects", {
-        "objectType": "contacts",
-        "inputs": [{"id": c} for c in contact_ids],
-        "properties": ["firstname", "lastname", "email", "engagement_score_v2", "nps"],
-    })
-
-    contacts = [_parse_contact(r) for r in contacts_raw.get("results", [])]
-    return [c for c in contacts if c.engagement_score_v2 is not None]
-
-
-def _parse_contact(raw: dict) -> Contact:
-    props = raw.get("properties", {})
-    score = props.get("engagement_score_v2")
-    nps = props.get("nps")
-    return Contact(
-        id=raw["id"],
-        first_name=props.get("firstname", ""),
-        last_name=props.get("lastname", ""),
-        email=props.get("email", ""),
-        engagement_score_v2=float(score) if score else None,
-        nps=float(nps) if nps else None,
-    )
-
-
-# ── Discrete property values (for UI dropdowns) ───────────────────────────────
-
-async def fetch_property_options(object_type: str, property_name: str) -> list[str]:
-    """Returns the enumeration options for a discrete HubSpot property."""
-    raw = await _call("hubspot-get-property", {
-        "objectType": object_type,
-        "propertyName": property_name,
-    })
-    options = raw.get("options", [])
-    return sorted([o["value"] for o in options if o.get("value")])
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _parse_date(value: str | None) -> date | None:
     if not value:
         return None
     try:
-        return date.fromisoformat(value[:10])
+        return date.fromisoformat(str(value)[:10])
     except ValueError:
         return None
-
-
-def run(coro):
-    """Convenience wrapper so sync Streamlit code can call async functions."""
-    return asyncio.run(coro)

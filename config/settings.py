@@ -4,7 +4,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
-HUBSPOT_ACCESS_TOKEN = os.environ["HUBSPOT_ACCESS_TOKEN"]
 NOTION_TOKEN = os.environ["NOTION_TOKEN"]
 NOTION_DIGEST_PAGE_ID = os.environ["NOTION_DIGEST_PAGE_ID"]
 PM_BOOKING_LINK = os.environ["PM_BOOKING_LINK"]

@@ -2,7 +2,6 @@
 ProductCRM — PM-facing Streamlit UI.
 Run with: streamlit run app.py
 """
-import asyncio
 from datetime import date, datetime
 
 import pandas as pd
@@ -45,9 +44,9 @@ with tab1:
 
     with st.spinner("Loading HubSpot filter options..."):
         try:
-            nature_options = hs.run(hs.fetch_property_options("companies", "nature"))
-            tier_options = hs.run(hs.fetch_property_options("companies", "tier_company"))
-            category_options = hs.run(hs.fetch_property_options("companies", "macro_category"))
+            nature_options = hs.fetch_property_options("companies", "nature")
+            tier_options = hs.fetch_property_options("companies", "tier_company")
+            category_options = hs.fetch_property_options("companies", "macro_category")
         except Exception as e:
             st.error(f"Could not load HubSpot options: {e}")
             nature_options, tier_options, category_options = [], [], []
@@ -74,7 +73,7 @@ with tab1:
     if st.button("Find qualifying companies & sample", type="primary"):
         with st.spinner("Querying HubSpot..."):
             try:
-                interviews, pool_size = asyncio.run(run_selection(
+                interviews, pool_size = run_selection(
                     n=int(n),
                     nature=nature or None,
                     tier_company=tier or None,
@@ -83,7 +82,7 @@ with tab1:
                     beginning_date_to=date_to if date_to else None,
                     arr_live_min=arr_min if arr_min > 0 else None,
                     arr_live_max=arr_max if arr_max > 0 else None,
-                ))
+                )
                 st.session_state.interviews = interviews
                 st.session_state.pool_size = pool_size
             except Exception as e:
