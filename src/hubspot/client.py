@@ -29,11 +29,14 @@ def _mcp_server_params() -> StdioServerParameters:
 
 
 async def _call(tool: str, args: dict) -> Any:
+    import json
     async with stdio_client(_mcp_server_params()) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
             result = await session.call_tool(tool, args)
-            return result.content
+            if result.content:
+                return json.loads(result.content[0].text)
+            return {}
 
 
 # ── Companies ────────────────────────────────────────────────────────────────
@@ -69,15 +72,28 @@ async def fetch_active_companies(
     if arr_live_max is not None:
         filters.append({"propertyName": "arr_live", "operator": "LTE", "value": str(arr_live_max)})
 
-    raw = await _call("hubspot_search_objects", {
-        "objectType": "companies",
-        "filterGroups": [{"filters": filters}],
-        "properties": ["name", "nature", "tier_company", "macro_category",
-                        "beginning_date", "arr_live", "country"],
-        "limit": 1000,
-    })
+    companies: list[Company] = []
+    after: str | None = None
 
-    return [_parse_company(r) for r in raw.get("results", [])]
+    while True:
+        payload: dict = {
+            "objectType": "companies",
+            "filterGroups": [{"filters": filters}],
+            "properties": ["name", "nature", "tier_company", "macro_category",
+                            "beginning_date", "arr_live", "country"],
+            "limit": 100,
+        }
+        if after:
+            payload["after"] = after
+
+        raw = await _call("hubspot-search-objects", payload)
+        companies.extend(_parse_company(r) for r in raw.get("results", []))
+
+        after = raw.get("paging", {}).get("next", {}).get("after")
+        if not after:
+            break
+
+    return companies
 
 
 def _parse_company(raw: dict) -> Company:
@@ -98,7 +114,7 @@ def _parse_company(raw: dict) -> Company:
 
 async def fetch_deals_for_company(company_id: str) -> list[Deal]:
     """Returns active deals (pipeline = ACTIVE_DEAL_PIPELINE) for a company."""
-    raw = await _call("hubspot_get_associations", {
+    raw = await _call("hubspot-list-associations", {
         "objectType": "companies",
         "objectId": company_id,
         "toObjectType": "deals",
@@ -108,7 +124,7 @@ async def fetch_deals_for_company(company_id: str) -> list[Deal]:
     if not deal_ids:
         return []
 
-    deals_raw = await _call("hubspot_batch_read_objects", {
+    deals_raw = await _call("hubspot-batch-read-objects", {
         "objectType": "deals",
         "inputs": [{"id": d} for d in deal_ids],
         "properties": ["dealname", "pipeline", "createdate"],
@@ -137,7 +153,7 @@ def _parse_deal(raw: dict) -> Deal:
 
 async def fetch_contacts_for_deal(deal_id: str) -> list[Contact]:
     """Returns contacts on a deal that have a non-empty engagement_score_v2."""
-    raw = await _call("hubspot_get_associations", {
+    raw = await _call("hubspot-list-associations", {
         "objectType": "deals",
         "objectId": deal_id,
         "toObjectType": "contacts",
@@ -147,7 +163,7 @@ async def fetch_contacts_for_deal(deal_id: str) -> list[Contact]:
     if not contact_ids:
         return []
 
-    contacts_raw = await _call("hubspot_batch_read_objects", {
+    contacts_raw = await _call("hubspot-batch-read-objects", {
         "objectType": "contacts",
         "inputs": [{"id": c} for c in contact_ids],
         "properties": ["firstname", "lastname", "email", "engagement_score_v2", "nps"],
@@ -175,7 +191,7 @@ def _parse_contact(raw: dict) -> Contact:
 
 async def fetch_property_options(object_type: str, property_name: str) -> list[str]:
     """Returns the enumeration options for a discrete HubSpot property."""
-    raw = await _call("hubspot_get_property", {
+    raw = await _call("hubspot-get-property", {
         "objectType": object_type,
         "propertyName": property_name,
     })

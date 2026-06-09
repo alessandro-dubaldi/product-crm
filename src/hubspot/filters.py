@@ -33,7 +33,13 @@ async def qualifying_companies(
         arr_live_max=arr_live_max,
     )
 
-    enriched = await asyncio.gather(*[_enrich(c) for c in companies])
+    sem = asyncio.Semaphore(10)
+
+    async def _enrich_limited(c):
+        async with sem:
+            return await _enrich(c)
+
+    enriched = await asyncio.gather(*[_enrich_limited(c) for c in companies])
     return [c for c in enriched if c is not None]
 
 

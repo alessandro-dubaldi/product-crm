@@ -4,7 +4,7 @@ Generates a personalized outreach email for each selected interview using Claude
 import anthropic
 
 from src.hubspot.models import SelectedInterview
-from config.settings import ANTHROPIC_API_KEY, PM_CALENDLY_LINK, PM_NAME
+from config.settings import ANTHROPIC_API_KEY, PM_BOOKING_LINK, PM_NAME
 
 _client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
@@ -34,7 +34,7 @@ Context about the customer:
 The email should:
 1. Be addressed to {contact.first_name} personally
 2. Briefly explain the purpose (understand how they use the product, improve it)
-3. Include this scheduling link: {PM_CALENDLY_LINK}
+3. Include this Google Calendar booking link: {PM_BOOKING_LINK}
 4. Be signed by {PM_NAME or "the Product Team"}
 5. Be under 150 words
 
