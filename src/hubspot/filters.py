@@ -13,7 +13,7 @@ def qualifying_companies(
     arr_live_min: float | None = None,
     arr_live_max: float | None = None,
 ) -> tuple[list[Company], int]:
-    return hs.fetch_qualifying_pool(
+    companies, total = hs.fetch_active_companies(
         nature=nature,
         tier_company=tier_company,
         macro_category=macro_category,
@@ -22,3 +22,17 @@ def qualifying_companies(
         arr_live_min=arr_live_min,
         arr_live_max=arr_live_max,
     )
+    return [c for c in (_enrich(c) for c in companies) if c is not None], total
+
+
+def _enrich(company: Company) -> Company | None:
+    deals = hs.fetch_deals_for_company(company.id)
+    if not deals:
+        return None
+    most_recent = deals[0]
+    contacts = hs.fetch_contacts_for_deal(most_recent.id)
+    if not contacts:
+        return None
+    most_recent.contacts = contacts
+    company.deals = [most_recent]
+    return company
