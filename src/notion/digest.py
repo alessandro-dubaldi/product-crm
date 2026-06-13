@@ -1,14 +1,10 @@
-import requests
+"""
+Generates the weekly digest with Claude and saves it to the local SQLite database.
+Previously posted to Notion — replaced with in-app storage.
+"""
 import anthropic
-from config.settings import ANTHROPIC_API_KEY, NOTION_TOKEN, NOTION_DIGEST_PAGE_ID
-from src.notion.interview_page import _heading, _paragraphs
-
-_BASE = "https://api.notion.com/v1"
-_HEADERS = {
-    "Authorization": f"Bearer {NOTION_TOKEN}",
-    "Notion-Version": "2022-06-28",
-    "Content-Type": "application/json",
-}
+from config.settings import ANTHROPIC_API_KEY
+from src.db import store as db
 
 _client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
@@ -19,9 +15,13 @@ _SYSTEM = (
 )
 
 
-def generate_weekly_digest(summaries: list[dict]) -> str:
+def generate_weekly_digest(summaries: list[dict]) -> tuple[str, int]:
+    """
+    Generates the digest text with Claude, saves it to the DB.
+    Returns (digest_text, digest_id).
+    """
     if not summaries:
-        return "No interviews this week."
+        return "No interviews this week.", 0
 
     combined = "\n\n---\n\n".join(
         f"**{s['company']} — {s['contact']} ({s['date']})**\n{s['summary']}"
@@ -46,35 +46,8 @@ Write a weekly product digest with:
 """}],
     )
     digest_text = response.content[0].text.strip()
+    date_range = f"{summaries[0]['date']} to {summaries[-1]['date']}"
 
-    title = f"Weekly Product Interview Digest — {summaries[0]['date']} to {summaries[-1]['date']}"
-    blocks = [
-        _heading(title, 1),
-        *_paragraphs(digest_text),
-        {"object": "block", "type": "divider", "divider": {}},
-        _heading("Interviews included", 2),
-        *[{"object": "block", "type": "bulleted_list_item", "bulleted_list_item": {
-            "rich_text": [{"type": "text", "text": {"content": f"{s['company']} — {s['contact']} ({s['date']})"}}]
-        }} for s in summaries],
-    ]
-
-    body = {
-        "parent": {"page_id": NOTION_DIGEST_PAGE_ID},
-        "properties": {
-            "title": {"title": [{"type": "text", "text": {"content": title}}]}
-        },
-        "children": blocks[:100],
-    }
-    r = requests.post(f"{_BASE}/pages", headers=_HEADERS, json=body, timeout=30)
-    r.raise_for_status()
-    page_id = r.json()["id"]
-
-    for i in range(100, len(blocks), 100):
-        requests.patch(
-            f"{_BASE}/blocks/{page_id}/children",
-            headers=_HEADERS,
-            json={"children": blocks[i:i + 100]},
-            timeout=30,
-        ).raise_for_status()
-
-    return f"https://notion.so/{page_id.replace('-', '')}"
+    db.init_db()
+    digest_id = db.save_digest(content=digest_text, date_range=date_range)
+    return digest_text, digest_id

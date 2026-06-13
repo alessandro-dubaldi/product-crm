@@ -1,0 +1,15 @@
+# Copy this file to users.yaml and fill in your credentials.
+# Generate a hashed password with:
+#   python -c "import bcrypt; print(bcrypt.hashpw(b'yourpassword', bcrypt.gensalt()).decode())"
+
+credentials:
+  usernames:
+    riccardo:
+      email: riccardo@example.com
+      name: Riccardo
+      password: $2b$12$REPLACE_WITH_HASHED_PASSWORD
+
+cookie:
+  name: productcrm_auth
+  key: REPLACE_WITH_RANDOM_SECRET_KEY   # any long random string
+  expiry_days: 30

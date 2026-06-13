@@ -1,4 +1,6 @@
 .env
+users.yaml
+data/
 .DS_Store
 **/.DS_Store
 __pycache__/

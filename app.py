@@ -2,30 +2,33 @@
 ProductCRM — PM-facing Streamlit UI.
 Run with: streamlit run app.py
 """
-from datetime import date, datetime
-from urllib.parse import quote
+from datetime import date
 
 import pandas as pd
 import streamlit as st
 
+from src.auth.manager import login_gate
+from src.profile import store as profile_store
+from src.templates import store as tpl_store
 from src.hubspot import client as hs
 from src.selection.pipeline import run_selection
-from src.outreach.sender import send_drafts
-from src.interviews.insights import generate_exec_summary
-from src.notion.interview_page import create_interview_page
-from src.notion.digest import generate_weekly_digest
+from src.outreach.sender import apply_template_to_interviews
+from src.db import store as db
+from config.settings import HS_TOKEN
 
 st.set_page_config(page_title="ProductCRM", layout="wide")
+
+# ── Auth ───────────────────────────────────────────────────────────────────────
+
+username, display_name, authenticator = login_gate()
+db.init_db()
+
 st.title("ProductCRM")
 st.caption("Product interview orchestration — from HubSpot to insights.")
 
-tab1, tab2, tab3, tab4 = st.tabs([
-    "1 · Filter & Sample",
-    "2 · Outreach",
-    "3 · Capture Insights",
-    "4 · Weekly Digest",
-])
-
+with st.sidebar:
+    st.write(f"Logged in as **{display_name}**")
+    authenticator.logout("Log out", "sidebar")
 
 # ── Shared session state ───────────────────────────────────────────────────────
 
@@ -33,16 +36,26 @@ if "interviews" not in st.session_state:
     st.session_state.interviews = []
 if "pool_size" not in st.session_state:
     st.session_state.pool_size = 0
-if "completed_interviews" not in st.session_state:
-    st.session_state.completed_interviews = []  # list of {company, contact, date, summary}
-if "drafts" not in st.session_state:
-    st.session_state.drafts = []
+
+# ── Tabs ───────────────────────────────────────────────────────────────────────
+
+tab1, tab2, tab3, tab4, tab_tpl, tab_profile = st.tabs([
+    "1 · Filter & Sample",
+    "2 · Outreach",
+    "3 · Capture Insights",
+    "4 · Weekly Digest",
+    "Templates",
+    "Profile",
+])
 
 
 # ── Tab 1: Filter & Sample ─────────────────────────────────────────────────────
 
 with tab1:
     st.subheader("Filter companies")
+
+    if not HS_TOKEN:
+        st.info("Running with mock HubSpot data. Set `HS_TOKEN` in `.env` to connect to your real CRM.")
 
     @st.cache_data(ttl=3600)
     def load_filter_options():
@@ -52,11 +65,11 @@ with tab1:
             hs.fetch_property_options("companies", "macro_category"),
         )
 
-    with st.spinner("Loading HubSpot filter options..."):
+    with st.spinner("Loading filter options..."):
         try:
             nature_options, tier_options, category_options = load_filter_options()
         except Exception as e:
-            st.error(f"Could not load HubSpot options: {e}")
+            st.error(f"Could not load filter options: {e}")
             nature_options, tier_options, category_options = [], [], []
 
     col1, col2, col3 = st.columns(3)
@@ -79,7 +92,7 @@ with tab1:
     n = st.number_input("Number of interviews to sample (N)", min_value=1, max_value=200, value=25)
 
     if st.button("Find qualifying companies & sample", type="primary"):
-        with st.spinner("Querying HubSpot..."):
+        with st.spinner("Querying companies..."):
             try:
                 interviews, pool_size = run_selection(
                     n=int(n),
@@ -124,97 +137,206 @@ with tab2:
     if not st.session_state.interviews:
         st.info("Run the filter & sample step first.")
     else:
-        st.write(
-            f"Ready to generate outreach emails for **{len(st.session_state.interviews)}** contacts. "
-            "Edit each email, then open in Gmail to send."
+        profile = profile_store.load(username)
+        booking_links = profile.get("booking_links", [])
+        pm_name = profile.get("name") or display_name
+        templates = tpl_store.list_templates(username)
+
+        # ── Booking link selector ──
+        if not booking_links:
+            st.warning("No booking links saved. Add one in the **Profile** tab first.")
+            st.stop()
+
+        link_labels = [lnk["label"] for lnk in booking_links]
+        selected_label = st.selectbox("Booking link", options=link_labels)
+        selected_url = next(lnk["url"] for lnk in booking_links if lnk["label"] == selected_label)
+        st.caption(selected_url)
+
+        st.divider()
+
+        # ── Template selector ──
+        if not templates:
+            st.warning("No email templates yet. Create one in the **Templates** tab first.")
+            st.stop()
+
+        tpl_names = [t["name"] for t in templates]
+        selected_tpl_name = st.selectbox("Email template", options=tpl_names)
+        selected_tpl = next(t for t in templates if t["name"] == selected_tpl_name)
+
+        st.divider()
+
+        # ── Editable template ──
+        st.subheader("Edit template")
+        st.caption(
+            "Variables — replaced automatically per contact: "
+            + "  ".join(f"`{v}`" for v, _ in tpl_store.VARIABLES)
         )
-        if st.button("Generate emails", type="primary"):
-            with st.spinner("Generating personalised emails..."):
-                try:
-                    st.session_state.drafts = send_drafts(st.session_state.interviews)
-                except Exception as e:
-                    st.error(f"Failed to generate emails: {e}")
 
-        if st.session_state.drafts:
-            st.success(f"{len(st.session_state.drafts)} emails ready.")
-            for idx, d in enumerate(st.session_state.drafts):
-                with st.expander(f"{d['contact_email']} — {d['subject']}"):
-                    subject = st.text_input("Subject", value=d["subject"], key=f"subj_{idx}")
-                    body = st.text_area("Body", value=d["body"], height=200, key=f"body_{idx}")
-                    gmail_url = (
-                        "https://mail.google.com/mail/?view=cm"
-                        f"&to={quote(d['contact_email'])}"
-                        f"&su={quote(subject)}"
-                        f"&body={quote(body)}"
-                    )
-                    st.link_button("Open in Gmail ↗", url=gmail_url)
+        edited_subject = st.text_input("Subject", value=selected_tpl["subject"])
+        edited_body = st.text_area("Body", value=selected_tpl["body"], height=220)
+
+        edited_tpl = {"subject": edited_subject, "body": edited_body}
+
+        st.divider()
+
+        # ── Preview for first contact ──
+        first = st.session_state.interviews[0]
+        preview = tpl_store.apply(
+            edited_tpl,
+            first_name=first.contact.first_name,
+            last_name=first.contact.last_name,
+            company=first.company.name,
+            booking_link=selected_url,
+            pm_name=pm_name,
+        )
+        with st.expander(f"Preview — {first.contact.first_name} {first.contact.last_name} ({first.company.name})", expanded=True):
+            st.markdown(f"**Subject:** {preview['subject']}")
+            st.text(preview["body"])
+
+        st.divider()
+
+        # ── Contacts table with per-row Gmail links ──
+        st.subheader(f"Send to {len(st.session_state.interviews)} contacts")
+        filled = apply_template_to_interviews(
+            st.session_state.interviews,
+            template=edited_tpl,
+            booking_link=selected_url,
+            pm_name=pm_name,
+        )
+        for row in filled:
+            col_a, col_b, col_c = st.columns([3, 4, 2])
+            with col_a:
+                st.write(f"**{row['first_name']} {row['last_name']}**")
+                st.caption(row["company"])
+            with col_b:
+                st.caption(row["contact_email"])
+            with col_c:
+                st.link_button("Open in Gmail ↗", url=row["gmail_url"])
 
 
-# ── Tab 3: Capture Insights ────────────────────────────────────────────────────
+# ── Tab 3: Capture Insights — Coming soon ─────────────────────────────────────
 
 with tab3:
     st.subheader("Capture interview insights")
-    st.write("Paste the call transcript below, then generate an exec summary and save to Notion.")
-
-    col_a, col_b, col_c = st.columns(3)
-    with col_a:
-        company_name = st.text_input("Company name")
-    with col_b:
-        contact_name = st.text_input("Contact name")
-    with col_c:
-        interview_date = st.date_input("Interview date", value=date.today())
-
-    transcript = st.text_area("Transcript", height=250, placeholder="Paste the call transcript here…")
-
-    if st.button("Generate exec summary", type="primary"):
-        if not company_name or not contact_name:
-            st.warning("Please fill in company and contact name.")
-        elif not transcript.strip():
-            st.warning("Please paste the transcript.")
-        else:
-            with st.spinner("Generating exec summary..."):
-                summary = generate_exec_summary(transcript, company_name, contact_name)
-
-            st.subheader("Exec Summary")
-            st.markdown(summary)
-
-            if st.button("Save to Notion"):
-                with st.spinner("Creating Notion page..."):
-                    url = create_interview_page(
-                        company_name=company_name,
-                        contact_name=contact_name,
-                        interview_date=interview_date.isoformat(),
-                        transcript=transcript,
-                        exec_summary=summary,
-                    )
-                    st.success(f"Notion page created: {url}")
-                    st.session_state.completed_interviews.append({
-                        "company": company_name,
-                        "contact": contact_name,
-                        "date": interview_date.isoformat(),
-                        "summary": summary,
-                    })
+    st.info("Coming soon — this feature requires an Anthropic API key.")
 
 
-# ── Tab 4: Weekly Digest ───────────────────────────────────────────────────────
+# ── Tab 4: Weekly Digest — Coming soon ────────────────────────────────────────
 
 with tab4:
     st.subheader("Weekly digest")
+    st.info("Coming soon — this feature requires an Anthropic API key.")
 
-    if not st.session_state.completed_interviews:
-        st.info("No completed interviews yet this session. Capture insights in Tab 3 first.")
-    else:
-        st.write(
-            f"{len(st.session_state.completed_interviews)} interviews captured this session. "
-            "Click below to synthesise and post the weekly digest to Notion."
-        )
-        for i in st.session_state.completed_interviews:
-            st.markdown(f"- **{i['company']}** — {i['contact']} ({i['date']})")
 
-        if st.button("Generate & post weekly digest to Notion", type="primary"):
-            with st.spinner("Synthesising insights and posting to Notion..."):
-                try:
-                    url = generate_weekly_digest(st.session_state.completed_interviews)
-                    st.success(f"Weekly digest posted: {url}")
-                except Exception as e:
-                    st.error(f"Failed to generate digest: {e}")
+# ── Templates tab ──────────────────────────────────────────────────────────────
+
+with tab_tpl:
+    st.subheader("Email templates")
+    st.caption(
+        "Available variables: "
+        + ", ".join(f"`{v}` ({desc})" for v, desc in tpl_store.VARIABLES)
+    )
+
+    user_templates = tpl_store.list_templates(username)
+
+    # ── Existing templates ──
+    for tpl in user_templates:
+        with st.expander(tpl["name"]):
+            with st.form(f"edit_tpl_{tpl['id']}"):
+                new_name = st.text_input("Name", value=tpl["name"])
+                new_subj = st.text_input("Subject", value=tpl["subject"])
+                new_body = st.text_area("Body", value=tpl["body"], height=200)
+                col_save, col_del = st.columns([1, 1])
+                with col_save:
+                    if st.form_submit_button("Save changes"):
+                        tpl_store.save_template(username, {
+                            "id": tpl["id"], "name": new_name,
+                            "subject": new_subj, "body": new_body,
+                        })
+                        st.success("Saved.")
+                        st.rerun()
+                with col_del:
+                    if st.form_submit_button("Delete", type="secondary"):
+                        tpl_store.delete_template(username, tpl["id"])
+                        st.rerun()
+
+    st.divider()
+
+    # ── New template ──
+    st.subheader("New template")
+    with st.form("new_tpl_form"):
+        new_name = st.text_input("Name")
+        new_subj = st.text_input("Subject")
+        new_body = st.text_area("Body", height=200)
+        if st.form_submit_button("Create template", type="primary"):
+            if new_name.strip() and new_subj.strip() and new_body.strip():
+                tpl_store.save_template(username, {
+                    "name": new_name.strip(),
+                    "subject": new_subj.strip(),
+                    "body": new_body.strip(),
+                })
+                st.success(f'Template "{new_name}" created.')
+                st.rerun()
+            else:
+                st.warning("All fields are required.")
+
+
+# ── Profile tab ────────────────────────────────────────────────────────────────
+
+with tab_profile:
+    st.subheader("Your profile")
+    profile = profile_store.load(username)
+
+    with st.form("profile_form"):
+        name_val = st.text_input("Display name", value=profile.get("name", ""))
+        email_val = st.text_input("Email", value=profile.get("email", ""))
+        st.caption("Used as the sender signature in outreach emails (`{{pm_name}}`).")
+        if st.form_submit_button("Save profile"):
+            profile["name"] = name_val.strip()
+            profile["email"] = email_val.strip()
+            profile_store.save(username, profile)
+            st.success("Profile saved.")
+
+    st.divider()
+    st.subheader("Booking links")
+    st.caption("Add one or more Google Calendar appointment links. You'll pick which one to use in the Outreach tab.")
+
+    links = profile.get("booking_links", [])
+    to_delete = None
+
+    for idx, lnk in enumerate(links):
+        col_l, col_u, col_del = st.columns([2, 4, 1])
+        with col_l:
+            new_label = st.text_input("Label", value=lnk["label"], key=f"lbl_{idx}")
+        with col_u:
+            new_url = st.text_input("URL", value=lnk["url"], key=f"url_{idx}")
+        with col_del:
+            st.write("")
+            if st.button("Remove", key=f"del_{idx}"):
+                to_delete = idx
+        links[idx] = {"label": new_label, "url": new_url}
+
+    if to_delete is not None:
+        links.pop(to_delete)
+        profile["booking_links"] = links
+        profile_store.save(username, profile)
+        st.rerun()
+
+    st.divider()
+    with st.form("add_link_form"):
+        st.write("Add a new booking link")
+        new_label = st.text_input("Label (e.g. '30-min product interview')")
+        new_url = st.text_input("Google Calendar URL")
+        if st.form_submit_button("Add"):
+            if new_label.strip() and new_url.strip():
+                links.append({"label": new_label.strip(), "url": new_url.strip()})
+                profile["booking_links"] = links
+                profile_store.save(username, profile)
+                st.success("Booking link added.")
+                st.rerun()
+            else:
+                st.warning("Both label and URL are required.")
+
+    if links != profile.get("booking_links"):
+        profile["booking_links"] = links
+        profile_store.save(username, profile)
